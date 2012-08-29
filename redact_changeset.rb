@@ -219,6 +219,10 @@ oparser = OptionParser.new do |opts|
   opts.on("-t", "--threads N", Integer, "Number of threads to use getting data from the API.") do |t|
     options[:threads] = t
   end
+
+  opts.on("-e", "--edits_blacklist FILE", "edits blacklist file to redact") do |e|
+    options[:edits_blacklist] = e
+  end
 end
 oparser.parse!
 
@@ -270,12 +274,27 @@ ARGV.each do |arg|
 
   input_changesets << cs_id
   to_redact += contents
-
-  puts "Threads: #{options[:threads].inspect} (changeset = #{cs_id})"
-  #puts contents.inspect
 end
 
+if options.has_key? :edits_blacklist then
+  to_redact += File.open(options[:edits_blacklist], "r").read.split("\n").map do |line|
+    type = line[0]
+    t = line[1..-1].split('v')
+    id = t[0].to_i
+    version = t[1].to_i
+    case type
+      when "n" then OSM::Node[[0,0], :id => id]
+      when "w" then OSM::Way[[], :id => id]
+      when "r" then OSM::Relation[[], :id => id]
+    end
+  end
+end
+  
+puts "Threads: #{options[:threads].inspect} (changesets = #{input_changesets})"
+#puts to_redact.inspect
+
 db = API_DB.new(server.server, to_redact, input_changesets)
+db.edit_blacklist = File.open(options[:edits_blacklist], "r").read.split("\n").to_set if options.has_key? :edits_blacklist
 bot = ChangeBot.new(db)
 
 puts('Processing all nodes')
