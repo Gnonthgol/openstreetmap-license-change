@@ -3,7 +3,7 @@ require './osm_parse'
 require './osm_print'
 require './changeset'
 require './user'
-require './db'
+require './api_db'
 require './change_bot'
 require 'net/http'
 require 'nokogiri'
@@ -16,6 +16,8 @@ require 'typhoeus'
 MAX_CHANGESET_ELEMENTS = 1000
 
 class Server
+  attr_accessor :server
+
   def initialize(file)
     auth = YAML.load(File.open(file))
     oauth = auth['oauth']
@@ -32,24 +34,9 @@ class Server
     @max_retries = 3
   end
 
-  def history(elt)
-    name = element_name(elt)
-    "#{@server}/api/0.6/#{name}/#{elt.element_id}/history"
-  end
-
   def changeset_contents(id)
     response = api_call_get("changeset/#{id}/download")
     parse_diff(response.body)
-  end
-  
-  def dependents(elt)
-    requests = []
-    name = element_name(elt)
-    if name == "node" 
-      requests << "#{@server}/api/0.6/node/#{elt.element_id}/ways"
-    end
-    requests << "#{@server}/api/0.6/#{name}/#{elt.element_id}/relations"
-    return requests
   end
 
   def create_changeset(comment, input_changesets)
@@ -259,6 +246,7 @@ input_changesets = []
 hydra = Typhoeus::Hydra.new(:max_concurrency => options[:threads])
 hydra.disable_memoization
 
+to_redact = []
 ARGV.each do |arg|
   # if the argument is a file on disk, then use that. otherwise, go to 
   # the API and fetch it from there.
@@ -281,81 +269,13 @@ ARGV.each do |arg|
   end
 
   input_changesets << cs_id
-  
+  to_redact += contents
+
   puts "Threads: #{options[:threads].inspect} (changeset = #{cs_id})"
   #puts contents.inspect
-
-  requests = contents.map do |elt|
-    urls = [server.history(elt)]
-    urls += server.dependents(elt)
-
-    urls.map do |url| 
-      #puts "REQ: #{url.inspect}"
-      req = Typhoeus::Request.new(url)
-      hydra.queue(req)
-      req
-    end
-  end
-
-  loop do
-    hydra.disable_memoization
-    hydra.run
-    hydra.disable_memoization
-
-    failed_requests = 0
-    requests.map! do |rqs|
-      rqs.map do |rq|
-        if rq.response.success?
-          rq
-        else
-          #puts "Retrying #{rq.url.inspect}"
-          new_rq = Typhoeus::Request.new(rq.url)
-          hydra.queue(new_rq)
-          failed_requests += 1
-          new_rq
-        end
-      end
-    end
-
-    break if failed_requests == 0
-    puts "Retrying #{failed_requests} failed requests."
-  end
-
-  results = []
-  requests.each do |rqs|
-    h_rq, *dep_rq = rqs
-    h = OSM.parse(h_rq.response.body)
-    dependents = dep_rq.collect_concat {|rq| OSM.parse(rq.response.body)}
-    results << [h, dependents]
-  end
-
-  results.each do |h, dependents|
-    elements[h.last.class][h.last.element_id] = h
-    dependents.each do |u|
-      unless elements[u.class].has_key? u.element_id
-        elements[u.class][u.element_id] = [u]
-      end
-    end
-  end
 end
 
-cs_ids = Set.new
-elements.each do |klass, elts|
-  elts.each do |id, vers|
-    vers.each do |elt|
-      #puts elt.inspect
-      cs_ids.add(elt.changeset_id)
-    end
-  end
-end
-
-changesets = Hash.new
-cs_ids.each do |id| 
-  ok = !(input_changesets.include?(id))
-  changesets[id] = Changeset[User[ok]]
-end
-
-db = DB.new(:changesets => changesets, :nodes => elements[OSM::Node], :ways => elements[OSM::Way], :relations => elements[OSM::Relation])
+db = API_DB.new(server.server, to_redact, input_changesets)
 bot = ChangeBot.new(db)
 
 puts('Processing all nodes')
